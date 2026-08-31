@@ -1,0 +1,57 @@
+{
+  "family": "appraisal-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/appraisalExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/appraisalTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "appraisal-api",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/appraisal-api:v1",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 8000, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "MODEL_BUCKET",      "value": "BUCKET" },
+        { "name": "MODEL_PREFIX",      "value": "models/v1" },
+        { "name": "PREDICTION_BUCKET", "value": "BUCKET" },
+        { "name": "PREDICTION_PREFIX", "value": "predictions" },
+        { "name": "REPORT_PREFIX",     "value": "reports" },
+        { "name": "AWS_REGION",        "value": "REGION" },
+        { "name": "LOG_BATCH_SIZE",    "value": "25" },
+        { "name": "LOG_FLUSH_SECONDS", "value": "60" },
+        { "name": "LOG_LEVEL",         "value": "INFO" },
+        { "name": "CORS_ORIGINS",      "value": "https://your-app.base44.app" }
+      ],
+      "secrets": [
+        {
+          "name": "API_KEYS",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:appraisal-api-keys"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/appraisal-api",
+          "awslogs-region": "REGION",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

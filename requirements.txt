@@ -1,0 +1,14 @@
+# Pinned exactly. XGBoost model files are forward-compatible but the sklearn
+# wrapper's attributes are not always, and an unpinned rebuild months from now
+# is how a working image silently starts producing different numbers.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+xgboost==2.1.3
+scikit-learn==1.6.0
+pandas==2.2.3
+numpy==2.2.1
+pyarrow==18.1.0
+boto3==1.35.87
+reportlab==4.2.5
+python-multipart==0.0.20

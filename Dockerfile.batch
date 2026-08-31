@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+#
+# Batch processor image — S3 upload triggers this.
+#
+# Build (Windows PowerShell, from the repo root):
+#     docker build --platform linux/amd64 -f Dockerfile.batch -t appraisal-batch:v1 .
+#
+# This is a SECOND image, separate from the API's Dockerfile. They share the
+# same app/ code but have different entrypoints and different runtimes, and
+# keeping them separate means a change to the API cannot break the training job.
+#
+# WHY LAMBDA RATHER THAN AN ECS TASK
+#   The job runs for about a minute when you upload a file and not at all the
+#   rest of the time. Lambda bills per 100ms and scales to zero on its own, so
+#   this costs effectively nothing. An ECS task for the same work needs a
+#   cluster, a task definition, and a Lambda to launch it anyway.
+#
+#   Keep to ECS instead if the job will exceed Lambda's 15-minute ceiling —
+#   roughly 50,000+ sales with a high bootstrap count. app/batch.py runs either
+#   way: `lambda_handler` for Lambda, `python -m app.batch <bucket> <key>` for
+#   ECS or your laptop. Nothing in the job logic changes.
+
+FROM public.ecr.aws/lambda/python:3.12
+
+# libgomp is XGBoost's OpenMP runtime. Without it `import xgboost` fails at
+# cold start with a linker error and Lambda reports only "Runtime.ImportModuleError".
+RUN dnf install -y libgomp && dnf clean all
+
+# LAMBDA_TASK_ROOT is /var/task. Requirements first so the dependency layer
+# caches independently of the application code.
+COPY requirements-batch.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements-batch.txt
+
+COPY app/ ${LAMBDA_TASK_ROOT}/app/
+
+# module.function — Lambda's container runtime calls this on each invocation.
+CMD ["app.batch.lambda_handler"]

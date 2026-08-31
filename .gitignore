@@ -1,0 +1,21 @@
+# Never commit credentials
+.env
+.env.*
+*.pem
+.aws/
+
+# Artifacts belong in S3, not in git. They are large and versioned by prefix.
+artifacts/
+notebooks/artifacts/
+reports/
+
+# Data
+*.xlsx
+*.csv
+data/
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
