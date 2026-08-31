@@ -1,8 +1,18 @@
-# Batch job dependencies. No FastAPI/uvicorn -- the batch image serves no HTTP.
+﻿# Batch job dependencies. No FastAPI/uvicorn -- the batch image serves no HTTP.
 # openpyxl is here and NOT in the API's requirements, because only the batch
 # job writes workbooks.
+#
+# scikit-learn is pinned BELOW 1.6.0 deliberately. Version 1.6.0 introduced a
+# new internal "tags" API (__sklearn_tags__) that XGBoost 2.1.3's sklearn
+# wrapper does not implement, and cross_val_score's internal is_classifier()
+# check calls straight into it -- every training job fails at the
+# cross-validation step with "AttributeError: 'super' object has no
+# attribute '__sklearn_tags__'". 1.5.2 predates that API change entirely.
+# Confirmed against cross_val_score, permutation_importance, and
+# LinearRegression -- the three sklearn entry points this pipeline actually
+# calls -- before pinning.
 xgboost==2.1.3
-scikit-learn==1.6.0
+scikit-learn==1.5.2
 pandas==2.2.3
 numpy==2.2.1
 pyarrow==18.1.0
