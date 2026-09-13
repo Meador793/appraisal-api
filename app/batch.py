@@ -56,17 +56,23 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
 DEFAULT_COLS = {
     "main_sqft": "Main Level SqFt",
     "upper_sqft": "Upper SqFt",
-    "bsmt_fin_sqft": "Apprx Below Grade Fin SqFt",
-    "bedrooms": "Bedrooms",
-    "baths_full": "Baths Full",
-    "baths_half": "Baths Half",
+    # Each of these is a list of header spellings seen across real MLS
+    # exports, tried in order -- the first one present in the export wins.
+    # Confirmed against an actual Indiana/BLC-style export where five of
+    # these fields used different names than the single-string defaults
+    # assumed, and every one of them silently went missing as a result.
+    "bsmt_fin_sqft": ["Apprx Below Grade Fin SqFt", "Apprx Below Grade Finished SqFt",
+                     "Below Grade Finished SqFt", "Below Grade Area SqFt"],
+    "bedrooms": ["Bedrooms", "Bedrooms Total", "Bedrooms MU"],
+    "baths_full": ["Baths Full", "Bathrooms Full", "Full Baths MU", "Full Bathrooms MU"],
+    "baths_half": ["Baths Half", "Bathrooms Half", "Half Baths MU", "Half Bathrooms MU"],
     "garage_spaces": "Garage Spaces",
-    "fireplaces": "Fireplaces",
+    "fireplaces": ["Fireplaces", "Fireplaces Total"],
     "lot_sqft": "Lot Size SqFt",
     "year_built": "Year Built",
     "close_date": "Close Date",
     "location": "Area",
-    "concessions": "Concessions",
+    "concessions": ["Concessions", "Seller Concessions Amount"],
 }
 
 BASE_CONFIG = {
@@ -226,7 +232,9 @@ def run_analysis_job(df_raw: pd.DataFrame, cfg: dict, job_name: str,
     log("Building PDF...")
     files["market_report.pdf"] = build_market_report(
         meta, result["grid"], result["percent"], result["location"], result["importance"],
-        data=result.get("data"), X=result.get("X"), y=result.get("y"))
+        data=result.get("data"), X=result.get("X"), y=result.get("y"),
+        y_test=result.get("y_test"), xgb_test_pred=result.get("xgb_test_pred"),
+        rf_test_pred=result.get("rf_test_pred"))
 
     log("Building Excel workbook...")
     files["adjustment_analysis.xlsx"] = build_workbook(

@@ -447,13 +447,18 @@ def build_report(payload: dict, subject: dict, meta: dict,
 # ==========================================================================
 
 def build_market_report(meta: dict, grid, pct, loc, importance,
-                        data=None, X=None, y=None) -> bytes:
+                        data=None, X=None, y=None,
+                        y_test=None, xgb_test_pred=None, rf_test_pred=None) -> bytes:
     """
     data, X, y : the engineered training frame and design matrix, passed
     through from run_dataset()'s return. Optional and None-safe -- if a
     caller doesn't have them, the report still builds, it just skips the
     exploratory and diagnostic charts that need the raw sample rather than
     the summary tables.
+
+    y_test, xgb_test_pred, rf_test_pred : the held-out later period and
+    each model's predictions on it, for the actual-vs-predicted and
+    residual diagnostic charts. Also optional and None-safe.
     """
     ss = _styles()
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -537,6 +542,42 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
                 "in the model somewhat arbitrarily -- their individual adjustments in the "
                 "grid are less stable than the pair's combined effect.", ss["Body"]))
             S.append(_embed_chart(correlation_heatmap_chart(X, y), max_width_inch=5.8))
+
+            # Sorted summary table -- the heatmap shows every pairwise value,
+            # but the single number most people actually want first is "which
+            # characteristics track price the most," in order.
+            numeric_cols = [c for c in X.columns if not c.startswith("loc_")]
+            corr_with_price = X[numeric_cols].corrwith(y).sort_values(key=abs, ascending=False)
+            S.append(Spacer(1, 10))
+            S.append(Paragraph("Correlation with sale price, strongest first", ss["H3"]))
+            rows = [["Characteristic", "Correlation with price"]]
+            for feat, val in corr_with_price.items():
+                rows.append([feat, f"{val:.3f}"])
+            S.append(_table(rows, [3.5 * inch, 2.5 * inch], align_right=[1]))
+
+            full_corr = X[numeric_cols].corr()
+            pairs = []
+            for i, a in enumerate(numeric_cols):
+                for b in numeric_cols[i + 1:]:
+                    v = full_corr.loc[a, b]
+                    if abs(v) > 0.70:
+                        pairs.append((a, b, v))
+            if pairs:
+                S.append(Spacer(1, 8))
+                S.append(Paragraph(
+                    "<b>Multicollinearity warning:</b> the following characteristic pairs "
+                    "are correlated above 0.70 with EACH OTHER (not with price). Their "
+                    "individual dollar adjustments above are less trustworthy than the "
+                    "pair's combined effect -- the model has to arbitrarily decide how much "
+                    "credit each one gets.", ss["Small"]))
+                for a, b, v in pairs:
+                    S.append(Paragraph(f"&nbsp;&nbsp;{a} &harr; {b}: {v:.2f}", ss["Small"]))
+            else:
+                S.append(Spacer(1, 8))
+                S.append(Paragraph(
+                    "No characteristic pairs correlated above 0.70 with each other. "
+                    "Coefficients here can be interpreted individually with more confidence.",
+                    ss["Small"]))
         S.append(PageBreak())
 
     # -------------------------------------------------------------- grid
@@ -607,10 +648,16 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
     # --------------------------------------------------- model selection
     S.append(Paragraph("Model selection: XGBoost against Random Forest", ss["H2"]))
     S.append(Paragraph(
-        "Both are tree ensembles and neither assumes a fixed dollar adjustment per unit. They "
-        "are compared on the same held-out later period. R-squared here is not comparable to "
-        "another market's, because it depends on that sample's price dispersion; compare MAE "
-        "as a percentage of mean price across markets instead.", ss["Body"]))
+        "Both are tree ensembles and neither assumes a fixed dollar adjustment per unit. "
+        "They are compared on ONE thing: how well each one predicts the later sales in "
+        "THIS market, having only seen the earlier sales in THIS market during training. "
+        "Every dataset uploaded to this pipeline trains and evaluates its own model "
+        "independently -- this comparison says nothing about how either model would "
+        "perform on a different market or a future upload; it only answers whether this "
+        "specific model, trained on this specific sample, still tracks this same market's "
+        "most recent sales. R-squared here is not comparable to another market's report, "
+        "because it depends on that sample's own price dispersion; compare MAE as a "
+        "percentage of mean price across markets instead.", ss["Body"]))
     rows = [["Metric (held-out sales)", "XGBoost", "Random Forest"]]
     for label, key, fmt in [("R-squared", "r2", "{:.4f}"), ("Mean absolute error", "mae", "money"),
                             ("Root mean squared error", "rmse", "money"),
@@ -620,11 +667,44 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
         f = (lambda v: _money(v)) if fmt == "money" else (lambda v: fmt.format(v))
         rows.append([label, f(x) if x is not None else "-", f(rr) if rr is not None else "-"])
     S.append(_table(rows, [2.8 * inch, 1.6 * inch, 1.6 * inch], align_right=[1, 2]))
-    if cmp_:
-        from .charts import model_comparison_chart
-        S.append(Spacer(1, 8))
-        S.append(_embed_chart(model_comparison_chart(cmp_), max_width_inch=4.6))
+
+    r2x = cmp_.get("xgboost", {}).get("r2")
+    if r2x is not None and not (isinstance(r2x, float) and r2x != r2x) and r2x < 0:
+        S.append(Spacer(1, 6))
+        S.append(Paragraph(
+            f"<b>A negative R-squared ({r2x:.2f}) is a real result, not an error.</b> "
+            "R-squared compares the model's error against the error of simply guessing the "
+            "mean price for every property. A negative value means the model did WORSE than "
+            "that on the held-out later sales -- usually a sign of a small or heavily "
+            "range-restricted sample (see the data adequacy warning above) where the model "
+            "picked up noise in the training period that does not hold up on the later "
+            "sales. It is the system correctly telling you not to trust this model's "
+            "accuracy, not a bug in how the number was computed.", ss["Small"]))
+
+    if y_test is not None and xgb_test_pred is not None and rf_test_pred is not None and len(y_test):
+        from .charts import prediction_diagnostics_chart
+        S.append(Spacer(1, 10))
+        S.append(Paragraph("Actual vs predicted, and residuals", ss["H3"]))
+        S.append(Paragraph(
+            "This is the regression equivalent of a ROC curve. A ROC curve and its AUC "
+            "score do not apply to this system: both are defined for a binary yes/no "
+            "outcome scored at a sweep of probability thresholds, and this pipeline "
+            "predicts a continuous dollar amount, not a class label -- there is no "
+            "threshold to sweep and no positive/negative case to score. The equivalent "
+            "question for a regression model is answered by the two chart types below. "
+            "Top row: every held-out sale plotted as actual price against predicted "
+            "price -- a perfect model puts every point on the dashed diagonal. Bottom row: "
+            "the same predictions' errors plotted against the predicted price -- this should "
+            "look like structureless noise centered on zero. A visible slope, curve, or "
+            "funnel shape means the model is systematically wrong in a particular price "
+            "range, which is a more specific and more actionable finding than a single "
+            "R-squared number.", ss["Body"]))
+        S.append(_embed_chart(
+            prediction_diagnostics_chart(y_test, xgb_test_pred, rf_test_pred),
+            max_width_inch=6.6))
+
     if cmp_.get("verdict"):
+        S.append(Spacer(1, 6))
         S.append(Paragraph(f"<b>Selection:</b> {cmp_['verdict']}", ss["Body"]))
 
     tuning = meta.get("hyperparameter_tuning", {})

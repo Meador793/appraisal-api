@@ -95,22 +95,46 @@ def to_num(series) -> pd.Series:
 
 def _col(df: pd.DataFrame, name):
     """
-    Fetch a mapped column, tolerating the two cases that come up constantly
+    Fetch a mapped column, tolerating the cases that come up constantly
     when you reuse this pipeline on a second MLS export:
 
-        cols["fireplaces"] = None      the field does not exist in this market
-        cols["fireplaces"] = "Fplc"    mapped, but this export actually lacks it
+        cols["fireplaces"] = None                  the field doesn't exist here
+        cols["fireplaces"] = "Fplc"                 mapped, but this export lacks it
+        cols["fireplaces"] = ["Fireplaces",         a list of common real-world
+                              "Fireplaces Total"]   header variants -- the first
+                                                     one found in this export wins
 
-    Both return an all-NaN column instead of raising. The caller records the
-    field as missing, and build_design_matrix then DROPS it from the model
-    rather than feeding in a column of zeros. That distinction matters: a
-    constant column is not "a characteristic the market pays nothing for", it
-    is "a question this dataset cannot answer", and an adjustment grid must
-    never make those two look the same.
+    The list form exists because the same logical field is spelled differently
+    across MLS systems even within one region -- "Bedrooms" vs "Bedrooms Total"
+    vs "Bedrooms MU", "Baths Full" vs "Bathrooms Full" vs "Full Baths MU". Trying
+    a short list of known variants means a real export from a slightly
+    different source often works with zero configuration, instead of every
+    field silently going missing until someone notices and writes a sidecar
+    config.
+
+    All paths return an all-NaN column instead of raising when nothing matches.
+    The caller records the field as missing, and build_design_matrix then DROPS
+    it from the model rather than feeding in a column of zeros. That
+    distinction matters: a constant column is not "a characteristic the market
+    pays nothing for", it is "a question this dataset cannot answer", and an
+    adjustment grid must never make those two look the same.
     """
-    if name is None or name not in df.columns:
-        return pd.Series(np.nan, index=df.index, dtype="float64")
-    return df[name]
+    candidates = [name] if isinstance(name, str) else (name or [])
+    for candidate in candidates:
+        if candidate is not None and candidate in df.columns:
+            return df[candidate]
+    return pd.Series(np.nan, index=df.index, dtype="float64")
+
+
+def _resolved_name(df: pd.DataFrame, name):
+    """Which candidate (if any) actually matched, for reporting which real
+    header a field was found under -- useful when a list of aliases is in
+    play and you want to confirm which one fired."""
+    candidates = [name] if isinstance(name, str) else (name or [])
+    for candidate in candidates:
+        if candidate is not None and candidate in df.columns:
+            return candidate
+    return None
 
 
 def _gla(main_sqft, upper_sqft):
@@ -184,9 +208,10 @@ def build_training_frame(df_sold: pd.DataFrame, cfg: dict):
     data["close_date"] = close_date
 
     # --- LOCATION ----------------------------------------------------------
+    location_resolved = _resolved_name(df_sold, c.get("location"))
     data["location"] = (
         _col(df_sold, c.get("location")).astype(str).str.strip()
-        if c.get("location") and c["location"] in df_sold.columns else "ALL"
+        if location_resolved else "ALL"
     )
 
     data = data.dropna(subset=["sale_price", "gla_sqft"])
@@ -196,10 +221,13 @@ def build_training_frame(df_sold: pd.DataFrame, cfg: dict):
     # Which mapped fields this export actually lacked. build_design_matrix uses
     # this to drop them, and the metadata records it so a reviewer can see that
     # the model was silent on a characteristic rather than valuing it at zero.
+    # mls can now be a single name or a list of candidate aliases -- resolved
+    # via the same lookup _col uses, so a field only counts as missing when
+    # NONE of its aliases matched.
     missing_fields = sorted(
         generic for generic, mls in c.items()
         if generic in NUMERIC_FEATURE_SOURCES
-        and (mls is None or mls not in df_sold.columns)
+        and _resolved_name(df_sold, mls) is None
     )
 
     meta_bits = {

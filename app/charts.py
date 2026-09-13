@@ -74,50 +74,64 @@ def characteristics_grid_chart(data: pd.DataFrame) -> bytes:
     regression template's exploratory layout."""
     fig, ax = plt.subplots(2, 3, figsize=(11, 6.4))
 
+    def _no_data(a, label):
+        """A characteristic that is missing or was dropped for having no
+        variation still gets its panel -- but showing an empty axes with
+        default 0-1 limits looks like a rendering bug, not like 'this
+        export doesn't have this field.' Say so directly instead."""
+        a.text(0.5, 0.5, "Not available\nin this export", ha="center", va="center",
+              fontsize=10, color="#888888", transform=a.transAxes)
+        a.set_xticks([])
+        a.set_yticks([])
+        a.set_title(f"Price by {label}")
+
     def _box(a, col, label, color):
+        if col not in data.columns or data[col].notna().sum() == 0:
+            _no_data(a, label)
+            return
         present = data[data[col].notna()]
         groups, ticks = [], []
         for level, g in present.groupby(col):
             if len(g):
                 groups.append(g["sale_price"].values)
                 ticks.append(str(int(level)))
-        if groups:
-            bp = a.boxplot(groups, tick_labels=ticks, patch_artist=True)
-            for box in bp["boxes"]:
-                box.set_facecolor(color)
-                box.set_alpha(0.75)
+        if not groups:
+            _no_data(a, label)
+            return
+        bp = a.boxplot(groups, tick_labels=ticks, patch_artist=True)
+        for box in bp["boxes"]:
+            box.set_facecolor(color)
+            box.set_alpha(0.75)
         a.set_xlabel(label)
         a.set_ylabel("sale_price")
         a.set_title(f"Price by {label}")
+
+    def _scatter(a, col, label, xlabel, color, trend=False):
+        if col not in data.columns or data[col].notna().sum() == 0:
+            _no_data(a, label)
+            return
+        sub = data[[col, "sale_price"]].dropna()
+        x = sub[col].astype(float).values
+        y = sub["sale_price"].astype(float).values
+        a.scatter(x, y, alpha=0.55, color=color, s=24)
+        if trend and len(x) >= 2 and np.ptp(x) > 0:
+            coef = np.polyfit(x, y, 1)
+            xs = np.linspace(x.min(), x.max(), 20)
+            a.plot(xs, np.polyval(coef, xs), "r--", lw=1.6,
+                  label=f"Trend: ${coef[0]:,.0f}/month")
+            a.legend(fontsize=8)
+        a.set_xlabel(xlabel)
+        a.set_ylabel("Sale Price ($)")
+        a.set_title(label)
 
     _box(ax[0, 0], "bedrooms", "Bedroom Count", "#3498db")
     _box(ax[0, 1], "baths_full", "Full Bathroom Count", "#2ecc71")
     _box(ax[0, 2], "garage_spaces", "Garage Spaces", "#e67e22")
 
-    ax[1, 0].scatter(data["age_at_sale"], data["sale_price"], alpha=0.55,
-                     color="#9b59b6", s=24)
-    ax[1, 0].set_xlabel("Age at Sale (years)")
-    ax[1, 0].set_ylabel("Sale Price ($)")
-    ax[1, 0].set_title("Price vs Age")
-
-    ax[1, 1].scatter(data["lot_sqft"], data["sale_price"], alpha=0.55,
-                     color="#1abc9c", s=24)
-    ax[1, 1].set_xlabel("Lot Size (sq ft)")
-    ax[1, 1].set_ylabel("Sale Price ($)")
-    ax[1, 1].set_title("Price vs Lot Size")
-
-    x = data["months_since_start"].astype(float).values
-    y = data["sale_price"].astype(float).values
-    ax[1, 2].scatter(x, y, alpha=0.55, color="#e74c3c", s=24)
-    if len(x) >= 2 and np.ptp(x) > 0:
-        coef = np.polyfit(x, y, 1)
-        xs = np.linspace(x.min(), x.max(), 20)
-        ax[1, 2].plot(xs, np.polyval(coef, xs), "r--", lw=1.6,
-                      label=f"Trend: ${coef[0]:,.0f}/month")
-        ax[1, 2].legend(fontsize=8)
-    ax[1, 2].set_xlabel("Months Since First Sale")
-    ax[1, 2].set_ylabel("Sale Price ($)")
-    ax[1, 2].set_title("Market Conditions Over Time")
+    _scatter(ax[1, 0], "age_at_sale", "Price vs Age", "Age at Sale (years)", "#9b59b6")
+    _scatter(ax[1, 1], "lot_sqft", "Price vs Lot Size", "Lot Size (sq ft)", "#1abc9c")
+    _scatter(ax[1, 2], "months_since_start", "Market Conditions Over Time",
+            "Months Since First Sale", "#e74c3c", trend=True)
 
     fig.tight_layout()
     return _fig_to_png(fig)
@@ -144,6 +158,53 @@ def correlation_heatmap_chart(X: pd.DataFrame, y: pd.Series) -> bytes:
                     fontsize=6.5, color="white" if abs(v) > 0.55 else "black")
     fig.colorbar(im, ax=ax, shrink=0.8)
     ax.set_title("Correlation Matrix")
+    fig.tight_layout()
+    return _fig_to_png(fig)
+
+
+def prediction_diagnostics_chart(y_test, xgb_pred, rf_pred) -> bytes:
+    """
+    Actual-vs-predicted and residual plots for both models on the held-out
+    later period. This is the regression equivalent of what a ROC curve
+    does for a classifier -- a visual read on how well the model
+    discriminates -- but ROC/AUC themselves do not apply here: they are
+    defined for a binary yes/no outcome scored by a threshold-varying
+    probability, and this system predicts a continuous dollar amount.
+    There is no threshold to sweep and no positive/negative class to score.
+
+    A perfect model would put every point in the top row on the dashed
+    diagonal. The bottom row should look like structureless noise centered
+    on zero; a visible slope, curve, or funnel shape there means the model
+    is systematically off in some price range rather than merely imprecise
+    everywhere -- a materially different, more specific finding than the
+    single R-squared/MAE numbers in the table above convey.
+    """
+    y_test = np.asarray(y_test, dtype=float)
+    fig, ax = plt.subplots(2, 2, figsize=(10, 8))
+
+    for col, (name, pred, color) in enumerate([
+        ("XGBoost", np.asarray(xgb_pred, dtype=float), "#2E86C1"),
+        ("Random Forest", np.asarray(rf_pred, dtype=float), "#27AE60"),
+    ]):
+        ax[0, col].scatter(y_test, pred, alpha=0.6, color=color, s=24,
+                          edgecolor="black", linewidth=0.3)
+        if len(y_test) >= 2:
+            lo = float(min(y_test.min(), pred.min()))
+            hi = float(max(y_test.max(), pred.max()))
+            ax[0, col].plot([lo, hi], [lo, hi], "k--", lw=1.3, label="Perfect prediction")
+            ax[0, col].legend(fontsize=7.5)
+        ax[0, col].set_xlabel("Actual Sale Price ($)")
+        ax[0, col].set_ylabel("Predicted Sale Price ($)")
+        ax[0, col].set_title(f"{name}: Actual vs Predicted")
+
+        resid = y_test - pred
+        ax[1, col].scatter(pred, resid, alpha=0.6, color=color, s=24,
+                          edgecolor="black", linewidth=0.3)
+        ax[1, col].axhline(0, color="black", lw=1.2, linestyle="--")
+        ax[1, col].set_xlabel("Predicted Sale Price ($)")
+        ax[1, col].set_ylabel("Residual (Actual - Predicted, $)")
+        ax[1, col].set_title(f"{name}: Residuals")
+
     fig.tight_layout()
     return _fig_to_png(fig)
 

@@ -393,4 +393,9 @@ def run_dataset(cfg: dict, df_raw: pd.DataFrame | None = None,
         "name": name, "metadata": metadata, "grid": grid, "percent": pct,
         "location": loc_adj, "importance": perm_df, "X": X, "y": y, "data": data,
         "xgb_model": final_model, "rf_model": rf_model, "diagnostics": diag,
+        # The held-out later period and each model's predictions on it -- used
+        # for the actual-vs-predicted and residual diagnostic charts. These
+        # are NOT from final_model (fit on all data); they are from the
+        # earlier xgb_model/rf_model fit, matching the reported test metrics.
+        "y_test": y_test, "xgb_test_pred": xp, "rf_test_pred": rp,
     }
