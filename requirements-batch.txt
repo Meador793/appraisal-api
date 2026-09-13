@@ -1,4 +1,4 @@
-﻿# Batch job dependencies. No FastAPI/uvicorn -- the batch image serves no HTTP.
+# Batch job dependencies. No FastAPI/uvicorn -- the batch image serves no HTTP.
 # openpyxl is here and NOT in the API's requirements, because only the batch
 # job writes workbooks.
 #
@@ -19,3 +19,5 @@ pyarrow==18.1.0
 boto3==1.35.87
 reportlab==4.2.5
 openpyxl==3.1.5
+matplotlib==3.9.2
+Pillow==11.0.0

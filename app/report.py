@@ -21,12 +21,13 @@ from __future__ import annotations
 import io
 from datetime import datetime, timezone
 
+from PIL import Image as PILImage
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import (BaseDocTemplate, Frame, KeepTogether, PageBreak,
+from reportlab.platypus import (BaseDocTemplate, Frame, Image, KeepTogether, PageBreak,
                                 PageTemplate, Paragraph, Spacer, Table, TableStyle)
 
 NAVY = colors.HexColor("#1F3864")
@@ -97,6 +98,19 @@ def _verdict_color(text: str):
     if t.startswith("WEAK"):
         return AMBER
     return RED
+
+
+def _embed_chart(png_bytes: bytes, max_width_inch: float = 6.8):
+    """Wrap chart PNG bytes as a ReportLab Image flowable at a fixed page
+    width, height computed from the image's own pixel aspect ratio so
+    nothing stretches or distorts. Reads dimensions via PIL rather than
+    letting ReportLab guess from the stream, which is the more reliable
+    path across ReportLab versions."""
+    img = PILImage.open(io.BytesIO(png_bytes))
+    w_px, h_px = img.size
+    width = max_width_inch * inch
+    height = width * (h_px / w_px)
+    return Image(io.BytesIO(png_bytes), width=width, height=height)
 
 
 class _Doc(BaseDocTemplate):
@@ -432,7 +446,15 @@ def build_report(payload: dict, subject: dict, meta: dict,
 # property is involved.
 # ==========================================================================
 
-def build_market_report(meta: dict, grid, pct, loc, importance) -> bytes:
+def build_market_report(meta: dict, grid, pct, loc, importance,
+                        data=None, X=None, y=None) -> bytes:
+    """
+    data, X, y : the engineered training frame and design matrix, passed
+    through from run_dataset()'s return. Optional and None-safe -- if a
+    caller doesn't have them, the report still builds, it just skips the
+    exploratory and diagnostic charts that need the raw sample rather than
+    the summary tables.
+    """
     ss = _styles()
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     buf = io.BytesIO()
@@ -489,6 +511,33 @@ def build_market_report(meta: dict, grid, pct, loc, importance) -> bytes:
             "These characteristics were excluded from the model rather than valued at zero. "
             "The analysis is silent on them; it does not conclude they are worthless.",
             ss["Body"]))
+
+    # ---------------------------------------------------- exploratory data
+    if data is not None and len(data):
+        from .charts import (characteristics_grid_chart, correlation_heatmap_chart,
+                             price_distribution_chart)
+
+        S.append(Paragraph("Exploratory data", ss["H2"]))
+        S.append(Paragraph(
+            "The raw sample before any adjustment is estimated -- what the market looked "
+            "like, unadjusted. The average price-per-square-foot in the left chart below is "
+            "not the same figure as the marginal rate in the adjustment grid that follows; "
+            "see 'The average and marginal rates are not interchangeable' at the end of this "
+            "report for why.", ss["Body"]))
+        S.append(_embed_chart(price_distribution_chart(data)))
+        S.append(Spacer(1, 8))
+        S.append(_embed_chart(characteristics_grid_chart(data)))
+
+        if X is not None and y is not None and len(X.columns) > 1:
+            S.append(Spacer(1, 10))
+            S.append(Paragraph(
+                "Correlation matrix", ss["H3"]))
+            S.append(Paragraph(
+                "Characteristics correlated above roughly 0.7 with each other share credit "
+                "in the model somewhat arbitrarily -- their individual adjustments in the "
+                "grid are less stable than the pair's combined effect.", ss["Body"]))
+            S.append(_embed_chart(correlation_heatmap_chart(X, y), max_width_inch=5.8))
+        S.append(PageBreak())
 
     # -------------------------------------------------------------- grid
     S.append(Paragraph("Adjustment grid", ss["H2"]))
@@ -550,6 +599,10 @@ def build_market_report(meta: dict, grid, pct, loc, importance) -> bytes:
     for r in importance.head(12).to_dict("records"):
         rows.append([r["Feature"], f"{r['Importance']:.4f}"])
     S.append(_table(rows, [3.2 * inch, 1.5 * inch], align_right=[1]))
+    if len(importance):
+        from .charts import permutation_importance_chart
+        S.append(Spacer(1, 8))
+        S.append(_embed_chart(permutation_importance_chart(importance), max_width_inch=6.2))
 
     # --------------------------------------------------- model selection
     S.append(Paragraph("Model selection: XGBoost against Random Forest", ss["H2"]))
@@ -567,8 +620,34 @@ def build_market_report(meta: dict, grid, pct, loc, importance) -> bytes:
         f = (lambda v: _money(v)) if fmt == "money" else (lambda v: fmt.format(v))
         rows.append([label, f(x) if x is not None else "-", f(rr) if rr is not None else "-"])
     S.append(_table(rows, [2.8 * inch, 1.6 * inch, 1.6 * inch], align_right=[1, 2]))
+    if cmp_:
+        from .charts import model_comparison_chart
+        S.append(Spacer(1, 8))
+        S.append(_embed_chart(model_comparison_chart(cmp_), max_width_inch=4.6))
     if cmp_.get("verdict"):
         S.append(Paragraph(f"<b>Selection:</b> {cmp_['verdict']}", ss["Body"]))
+
+    tuning = meta.get("hyperparameter_tuning", {})
+    xt, rt = tuning.get("xgboost", {}), tuning.get("random_forest", {})
+    if xt.get("learning_rate") is not None or rt.get("n_estimators") is not None:
+        S.append(Paragraph("How these models were tuned", ss["H3"]))
+        lines = []
+        if xt.get("learning_rate") is not None:
+            lines.append(
+                f"XGBoost: learning rate {xt['learning_rate']} and {xt['n_estimators']} trees, "
+                f"chosen by early stopping against a validation slice carved from the earlier "
+                f"training period (validation MAE {_money(xt.get('validation_mae'))}). The true "
+                f"held-out later period above was never used to make this choice.")
+        elif xt.get("tuned") is False:
+            lines.append("XGBoost: sample too small to tune safely; fixed defaults used.")
+        if rt.get("n_estimators") is not None:
+            parts = ", ".join(f"{k}={v}" for k, v in rt.items())
+            lines.append(f"Random Forest: {parts}, found by a bounded randomized search "
+                        f"over the training period.")
+        elif rt.get("tuned") is False:
+            lines.append("Random Forest: sample too small to tune safely; fixed defaults used.")
+        for line in lines:
+            S.append(Paragraph(line, ss["Small"]))
 
     m = meta.get("metrics", {})
     if m.get("cv_r2_mean") is not None:

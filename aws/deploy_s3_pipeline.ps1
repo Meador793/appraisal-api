@@ -1,4 +1,4 @@
-# deploy_s3_pipeline.ps1
+﻿# deploy_s3_pipeline.ps1
 #
 # One-shot deploy of the S3-triggered batch pipeline: bucket, ECR repo,
 # Lambda function, IAM role, and the S3 trigger that wires them together.
@@ -15,9 +15,26 @@
 #   - Docker Desktop running
 #   - This script sitting in <repo root>\aws\, next to Dockerfile.batch one
 #     level up
-
 $ErrorActionPreference = "Stop"
-
+# Two PowerShell behaviors around external commands (aws.exe, docker.exe)
+# both matter here, on different PowerShell versions:
+#
+# Windows PowerShell 5.1: merging a native command's stderr into the pipeline
+# with 2>&1 wraps that text as an ErrorRecord object. With
+# $ErrorActionPreference = "Stop" above, ANY ErrorRecord is fatal -- even
+# harmless stderr text from an expected failure, like checking whether a
+# brand-new S3 bucket exists yet (aws s3api head-bucket is SUPPOSED to fail
+# the first time). The fix used throughout this script is to redirect stderr
+# straight to $null instead of merging it with 2>&1, and rely on
+# $LASTEXITCODE alone, which every step below already does.
+#
+# PowerShell 7.3+: separately changed the default so that ANY external
+# command writing to stderr with a non-zero exit code respects
+# $ErrorActionPreference, which would cause the same kind of failure through
+# a different mechanism. This setting turns that back off, for forward
+# compatibility if this script is ever run under pwsh instead of
+# Windows PowerShell.
+$PSNativeCommandUseErrorActionPreference = $false
 # ==========================================================================
 # CONFIGURATION — the only section you should need to edit
 # ==========================================================================
@@ -29,24 +46,19 @@ $FUNCTION     = "appraisal-batch"
 $ROLE_NAME    = "appraisalBatchRole"
 $MEMORY_MB    = 3008    # also sets vCPU count on Lambda -- see DEPLOY_S3_PIPELINE.md
 $TIMEOUT_SEC  = 900     # Lambda's maximum
-
 # ==========================================================================
 Write-Host "`n=== Appraisal Batch Pipeline — AWS Deploy ===" -ForegroundColor Cyan
 Write-Host "Region: $REGION   Bucket: $BUCKET   Function: $FUNCTION`n"
-
 # --------------------------------------------------------------- preflight
 Write-Host "[1/9] Checking prerequisites..." -ForegroundColor Cyan
-
 try { docker version --format '{{.Server.Version}}' | Out-Null }
 catch { Write-Host "Docker is not running. Start Docker Desktop and re-run this script." -ForegroundColor Red; exit 1 }
-
 if (-not (Test-Path ".\Dockerfile.batch")) {
     Write-Host "Dockerfile.batch not found. Run this script from the repo root:" -ForegroundColor Red
     Write-Host "    cd path\to\appraisal-api" -ForegroundColor Yellow
     Write-Host "    .\aws\deploy_s3_pipeline.ps1" -ForegroundColor Yellow
     exit 1
 }
-
 $ACCOUNT = (aws sts get-caller-identity --query Account --output text 2>$null)
 if (-not $ACCOUNT) {
     Write-Host "AWS CLI is not configured. Run 'aws configure' first and paste in an IAM user's access key." -ForegroundColor Red
@@ -54,10 +66,11 @@ if (-not $ACCOUNT) {
 }
 Write-Host "  AWS account: $ACCOUNT" -ForegroundColor Green
 $REGISTRY = "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
-
 # --------------------------------------------------------------- S3 bucket
 Write-Host "`n[2/9] Creating S3 bucket..." -ForegroundColor Cyan
-$exists = aws s3api head-bucket --bucket $BUCKET 2>&1
+$ErrorActionPreference = "Continue"
+aws s3api head-bucket --bucket $BUCKET 2>$null 1>$null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -eq 0) {
     Write-Host "  s3://$BUCKET already exists, reusing it." -ForegroundColor Yellow
 } else {
@@ -71,40 +84,54 @@ if ($LASTEXITCODE -eq 0) {
         --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" | Out-Null
     Write-Host "  Created s3://$BUCKET (public access blocked)." -ForegroundColor Green
 }
-
 # --------------------------------------------------------------- ECR repo
 Write-Host "`n[3/9] Creating ECR repository..." -ForegroundColor Cyan
-aws ecr describe-repositories --repository-names $ECR_REPO --region $REGION 2>&1 | Out-Null
+$ErrorActionPreference = "Continue"
+aws ecr describe-repositories --repository-names $ECR_REPO --region $REGION 2>$null | Out-Null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -ne 0) {
     aws ecr create-repository --repository-name $ECR_REPO --region $REGION | Out-Null
     Write-Host "  Created ECR repo $ECR_REPO." -ForegroundColor Green
 } else {
     Write-Host "  ECR repo $ECR_REPO already exists, reusing it." -ForegroundColor Yellow
 }
-
 # --------------------------------------------------------- build and push
 Write-Host "`n[4/9] Building and pushing the Lambda image..." -ForegroundColor Cyan
 Write-Host "  This step takes a few minutes the first time (XGBoost, pandas, etc.)." -ForegroundColor DarkGray
-
 aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY
 if ($LASTEXITCODE -ne 0) { Write-Host "ECR login failed." -ForegroundColor Red; exit 1 }
-
-docker build --platform linux/amd64 -f Dockerfile.batch -t "${ECR_REPO}:${IMAGE_TAG}" .
+docker build --provenance=false --sbom=false --platform linux/amd64 -f Dockerfile.batch -t "${ECR_REPO}:${IMAGE_TAG}" .
 if ($LASTEXITCODE -ne 0) { Write-Host "Docker build failed." -ForegroundColor Red; exit 1 }
-
 docker tag "${ECR_REPO}:${IMAGE_TAG}" "${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
 docker push "${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
 if ($LASTEXITCODE -ne 0) { Write-Host "Docker push failed." -ForegroundColor Red; exit 1 }
 Write-Host "  Pushed ${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}" -ForegroundColor Green
-
 # --------------------------------------------------------------- IAM role
 Write-Host "`n[5/9] Creating IAM role for Lambda..." -ForegroundColor Cyan
-
-$trustPolicy = '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+# Built as a PowerShell object and converted with ConvertTo-Json, rather than
+# typed as a literal JSON string. A hand-typed '{"Version":"2012-10-17",...}'
+# is fragile in PowerShell: if the file's quote characters get altered by
+# anything upstream (an editor's smart-quote autocorrect, some clipboard
+# managers, certain git configurations), the string boundary breaks and
+# PowerShell reports it as a parse error pointing at the JSON's own colons
+# and quotes -- which looks like a bug in the AWS policy, not in how the
+# string was typed. Building it as a real object sidesteps the whole class
+# of failure.
+$trustPolicyObj = @{
+    Version   = "2012-10-17"
+    Statement = @(
+        @{
+            Effect    = "Allow"
+            Principal = @{ Service = "lambda.amazonaws.com" }
+            Action    = "sts:AssumeRole"
+        }
+    )
+}
 $trustFile = New-TemporaryFile
-Set-Content -Path $trustFile -Value $trustPolicy -NoNewline
-
-aws iam get-role --role-name $ROLE_NAME 2>&1 | Out-Null
+$trustPolicyObj | ConvertTo-Json -Depth 10 | Set-Content -Path $trustFile -NoNewline
+$ErrorActionPreference = "Continue"
+aws iam get-role --role-name $ROLE_NAME 2>$null | Out-Null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -ne 0) {
     aws iam create-role --role-name $ROLE_NAME `
         --assume-role-policy-document "file://$trustFile" | Out-Null
@@ -114,26 +141,31 @@ if ($LASTEXITCODE -ne 0) {
 } else {
     Write-Host "  Role $ROLE_NAME already exists, reusing it." -ForegroundColor Yellow
 }
-
 # Inline policy scoped to exactly this bucket -- not AmazonS3FullAccess.
-$s3Policy = @"
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:ListBucket"],"Resource":["arn:aws:s3:::$BUCKET","arn:aws:s3:::$BUCKET/*"]}]}
-"@
+$s3PolicyObj = @{
+    Version   = "2012-10-17"
+    Statement = @(
+        @{
+            Effect   = "Allow"
+            Action   = @("s3:GetObject", "s3:PutObject", "s3:ListBucket")
+            Resource = @("arn:aws:s3:::$BUCKET", "arn:aws:s3:::$BUCKET/*")
+        }
+    )
+}
 $s3PolicyFile = New-TemporaryFile
-Set-Content -Path $s3PolicyFile -Value $s3Policy -NoNewline
+$s3PolicyObj | ConvertTo-Json -Depth 10 | Set-Content -Path $s3PolicyFile -NoNewline
 aws iam put-role-policy --role-name $ROLE_NAME --policy-name appraisalBatchS3Access `
     --policy-document "file://$s3PolicyFile" | Out-Null
 Write-Host "  Attached S3 access scoped to s3://$BUCKET only." -ForegroundColor Green
-
 Write-Host "  Waiting for IAM role propagation (roles are eventually consistent)..." -ForegroundColor DarkGray
 Start-Sleep -Seconds 12
-
 # ----------------------------------------------------------- Lambda function
 Write-Host "`n[6/9] Creating the Lambda function..." -ForegroundColor Cyan
 $ROLE_ARN = "arn:aws:iam::${ACCOUNT}:role/${ROLE_NAME}"
 $IMAGE_URI = "${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
-
-aws lambda get-function --function-name $FUNCTION --region $REGION 2>&1 | Out-Null
+$ErrorActionPreference = "Continue"
+aws lambda get-function --function-name $FUNCTION --region $REGION 2>$null | Out-Null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -ne 0) {
     aws lambda create-function `
         --function-name $FUNCTION `
@@ -144,8 +176,13 @@ if ($LASTEXITCODE -ne 0) {
         --memory-size $MEMORY_MB `
         --environment "Variables={JOBS_BUCKET=$BUCKET,OUTPUT_BUCKET=$BUCKET,N_BOOTSTRAP=300}" `
         --region $REGION | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  Lambda function creation FAILED. See the error above." -ForegroundColor Red
+        Write-Host "  Common cause: the pushed image's manifest format. Confirm the docker" -ForegroundColor Yellow
+        Write-Host "  build step above included --provenance=false, then re-run this script." -ForegroundColor Yellow
+        exit 1
+    }
     Write-Host "  Created function $FUNCTION." -ForegroundColor Green
-
     Write-Host "  Waiting for the function to become active..." -ForegroundColor DarkGray
     aws lambda wait function-active --function-name $FUNCTION --region $REGION
 } else {
@@ -153,32 +190,48 @@ if ($LASTEXITCODE -ne 0) {
     aws lambda update-function-code --function-name $FUNCTION --image-uri $IMAGE_URI --region $REGION | Out-Null
     aws lambda wait function-updated --function-name $FUNCTION --region $REGION
 }
-
 # --------------------------------------------------------------- S3 trigger
 Write-Host "`n[7/9] Wiring up the S3 trigger..." -ForegroundColor Cyan
 $FUNCTION_ARN = (aws lambda get-function --function-name $FUNCTION --region $REGION --query 'Configuration.FunctionArn' --output text)
-
+if (-not $FUNCTION_ARN -or $FUNCTION_ARN -notmatch "^arn:aws:lambda:") {
+    Write-Host "  Could not retrieve the function's ARN (got: '$FUNCTION_ARN')." -ForegroundColor Red
+    Write-Host "  This means step 6 did not actually create the function. Scroll up to" -ForegroundColor Yellow
+    Write-Host "  find the real error, fix it, and re-run this script." -ForegroundColor Yellow
+    exit 1
+}
+$ErrorActionPreference = "Continue"
 aws lambda add-permission --function-name $FUNCTION `
     --statement-id s3invoke --action lambda:InvokeFunction `
     --principal s3.amazonaws.com --source-arn "arn:aws:s3:::$BUCKET" `
-    --region $REGION 2>&1 | Out-Null
+    --region $REGION 2>$null | Out-Null
+$ErrorActionPreference = "Stop"
 # Exit code ignored deliberately: this fails harmlessly on re-run because the
 # permission already exists, and there's no clean "does this exist" check.
-
-$notifConfig = @"
-{"LambdaFunctionConfigurations":[{"LambdaFunctionArn":"$FUNCTION_ARN","Events":["s3:ObjectCreated:*"],"Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"incoming/"}]}}}]}
-"@
+$notifConfigObj = @{
+    LambdaFunctionConfigurations = @(
+        @{
+            LambdaFunctionArn = $FUNCTION_ARN
+            Events            = @("s3:ObjectCreated:*")
+            Filter            = @{
+                Key = @{
+                    FilterRules = @(
+                        @{ Name = "prefix"; Value = "incoming/" }
+                    )
+                }
+            }
+        }
+    )
+}
 $notifFile = New-TemporaryFile
-Set-Content -Path $notifFile -Value $notifConfig -NoNewline
+$notifConfigObj | ConvertTo-Json -Depth 10 | Set-Content -Path $notifFile -NoNewline
 # NOTE: put-bucket-notification-configuration REPLACES the bucket's entire
 # trigger config, it does not add to it. Harmless on a fresh bucket. If you
 # later add a second trigger to this same bucket by hand in the console,
-# re-running this script will silently delete it -- edit the JSON above to
-# include both configurations instead of running this step again.
+# re-running this script will silently delete it -- edit $notifConfigObj
+# above to include both configurations instead of running this step again.
 aws s3api put-bucket-notification-configuration --bucket $BUCKET `
     --notification-configuration "file://$notifFile"
 Write-Host "  Uploads under incoming/ now trigger $FUNCTION." -ForegroundColor Green
-
 # --------------------------------------------------------------------- test
 Write-Host "`n[8/9] Verifying with a synthetic test file..." -ForegroundColor Cyan
 $testCsv = @"
@@ -189,10 +242,8 @@ Sold,380000,1400,850,650,3,2,1,2,0,10500,2001,2025-05-20,Westfield,0
 "@
 $testFile = Join-Path $env:TEMP "deploy-test.csv"
 Set-Content -Path $testFile -Value $testCsv -NoNewline
-
 aws s3 cp $testFile "s3://$BUCKET/incoming/analysis/deploy-test.csv" | Out-Null
 Write-Host "  Uploaded test file. Waiting up to 90s for Lambda to process it..." -ForegroundColor DarkGray
-
 $found = $false
 foreach ($i in 1..18) {
     Start-Sleep -Seconds 5
@@ -201,7 +252,6 @@ foreach ($i in 1..18) {
     $failed = aws s3 ls "s3://$BUCKET/failed/" --recursive 2>$null
     if ($failed) { break }
 }
-
 if ($found) {
     Write-Host "  SUCCESS. Output files:" -ForegroundColor Green
     aws s3 ls "s3://$BUCKET/outputs/analysis/" --recursive
@@ -210,7 +260,6 @@ if ($found) {
     aws s3 ls "s3://$BUCKET/failed/" --recursive
     Write-Host "    aws logs tail /aws/lambda/$FUNCTION --since 5m --region $REGION" -ForegroundColor Yellow
 }
-
 # --------------------------------------------------------------------- done
 Write-Host "`n[9/9] Deployment complete." -ForegroundColor Cyan
 Write-Host "==============================================================="
@@ -223,5 +272,4 @@ Write-Host "==============================================================="
 Write-Host "`nSave this bucket name -- $BUCKET -- you'll use it for every upload." -ForegroundColor Yellow
 Write-Host "To promote a model to production, see 'Promoting an analysis to a"
 Write-Host "deployed model' in DEPLOY_S3_PIPELINE.md."
-
 Remove-Item $trustFile, $s3PolicyFile, $notifFile, $testFile -ErrorAction SilentlyContinue

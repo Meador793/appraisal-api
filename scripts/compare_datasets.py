@@ -56,6 +56,13 @@ BASE = {
         "baths_half": 1, "garage_spaces": 1, "fireplaces": 1, "lot_sqft": 1,
         "age_at_sale": -1, "months_since_start": 1,
     },
+    "xgb_learning_rates": [0.03, 0.05, 0.08, 0.12],
+    "xgb_early_stopping_rounds": 30,
+    "xgb_tune_min_rows": 40,
+    "rf_tune_min_rows": 30,
+    "rf_search_n_iter": 20,
+    "rf_search_n_iter_medium": 12,
+    "rf_search_n_iter_large": 6,
     "local_artifacts": "artifacts",
     "aws_region": "us-east-2",
 }
