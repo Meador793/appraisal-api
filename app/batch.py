@@ -234,7 +234,12 @@ def run_analysis_job(df_raw: pd.DataFrame, cfg: dict, job_name: str,
         meta, result["grid"], result["percent"], result["location"], result["importance"],
         data=result.get("data"), X=result.get("X"), y=result.get("y"),
         y_test=result.get("y_test"), xgb_test_pred=result.get("xgb_test_pred"),
-        rf_test_pred=result.get("rf_test_pred"))
+        rf_test_pred=result.get("rf_test_pred"),
+        importance_compare=result.get("importance_compare"),
+        typical_value=result.get("typical_value"),
+        typical_contributions=result.get("typical_contributions"),
+        typical_scenarios=result.get("typical_scenarios"),
+        typical_row=result.get("typical_row"))
 
     log("Building Excel workbook...")
     files["adjustment_analysis.xlsx"] = build_workbook(

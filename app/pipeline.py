@@ -36,7 +36,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, RandomizedSearchCV, cross_val_score
 
-from .adjustments import adjustment_grid, location_effects, percent_grid
+from .adjustments import (adjustment_grid, compare_scenarios, contribution_breakdown,
+                         location_effects, percent_grid)
 from .features import build_design_matrix, build_training_frame
 
 
@@ -157,6 +158,8 @@ def diagnostics(data: pd.DataFrame) -> dict:
     """Diagnostic A from the notebook, as data rather than printed text."""
     price = data["sale_price"]
     d = {
+        "price_min": float(price.min()),
+        "price_max": float(price.max()),
         "price_range_ratio": float(price.max() / price.min()),
         "price_cv": float(price.std() / price.mean()),
         "raw_median_ppsf": float(data["ppsf"].median()),
@@ -171,6 +174,47 @@ def diagnostics(data: pd.DataFrame) -> dict:
         flags.append(f"Price-to-GLA correlation only {d['gla_corr']:.3f}.")
     d["flags"] = flags
     return d
+
+
+def feature_support(data: pd.DataFrame, min_level_count: int = 10) -> list[dict]:
+    """
+    Diagnostic B from the notebook: can this sample actually answer a
+    question about each discrete characteristic, or does it just look like
+    it can? A coefficient on 'garage_spaces' is only as trustworthy as the
+    number of sales backing each garage-count level -- a feature where 90%
+    of sales share one value has almost nothing to compare against, and its
+    adjustment is closer to noise than to an estimate, whatever its
+    confidence interval says.
+
+    Returns one row per discrete characteristic:
+      Levels_Supported : how many distinct values have >= min_level_count sales
+      Dominant_Share    : the fraction of the sample held by the single most
+                          common value
+      Verdict           : CANNOT ESTIMATE / WEAK / OK, mirroring the notebook
+    """
+    discrete_features = ["bedrooms", "baths_full", "baths_half", "garage_spaces", "fireplaces"]
+    rows = []
+    for feat in discrete_features:
+        if feat not in data.columns or data[feat].notna().sum() == 0:
+            rows.append({"Feature": feat, "Levels_Supported": 0, "Dominant_Share": None,
+                        "Verdict": "NOT IN THIS EXPORT"})
+            continue
+        counts = data[feat].value_counts()
+        if counts.empty:
+            continue
+        supported_levels = int((counts >= min_level_count).sum())
+        dominant_share = float(counts.max() / counts.sum())
+
+        if supported_levels < 2:
+            verdict = "CANNOT ESTIMATE - needs 2+ well-populated levels"
+        elif dominant_share > 0.80:
+            verdict = "WEAK - one level dominates; indicative only"
+        else:
+            verdict = "OK - sufficient variation to estimate"
+
+        rows.append({"Feature": feat, "Levels_Supported": supported_levels,
+                    "Dominant_Share": round(dominant_share, 3), "Verdict": verdict})
+    return rows
 
 
 def run_dataset(cfg: dict, df_raw: pd.DataFrame | None = None,
@@ -210,6 +254,10 @@ def run_dataset(cfg: dict, df_raw: pd.DataFrame | None = None,
     diag = diagnostics(data)
     for f in diag["flags"]:
         say(f"  RANGE RESTRICTION: {f}")
+
+    support = feature_support(data, cfg.get("min_level_count", 10))
+    for r in support:
+        say(f"  FEATURE SUPPORT: {r['Feature']} -- {r['Verdict']}")
 
     # --------------------------------------------------------------- split
     dates = data.loc[X.index, "close_date"]
@@ -295,6 +343,13 @@ def run_dataset(cfg: dict, df_raw: pd.DataFrame | None = None,
     # ------------------------------------------------ full-sample grids
     final_model = xgb.XGBRegressor(**params).fit(X, y)
     log_model = xgb.XGBRegressor(**params).fit(X, np.log(y))
+    log_r2 = float(log_model.score(X, np.log(y)))
+
+    # Random Forest refit on the full sample too, mirroring final_model above.
+    # This is what makes an apples-to-apples XGBoost-vs-Random-Forest
+    # importance comparison possible -- without it there would be no RF
+    # model that ever saw the full dataset the way final_model does.
+    final_rf_model = RandomForestRegressor(**rf_params).fit(X, y)
 
     n_boot = cfg.get("n_bootstrap", 400)
     grid = adjustment_grid(final_model, X, n_boot=n_boot,
@@ -307,11 +362,61 @@ def run_dataset(cfg: dict, df_raw: pd.DataFrame | None = None,
                        random_state=cfg.get("random_state", 42))
     loc_adj = location_effects(final_model, X, baseline_loc)
 
-    perm = permutation_importance(final_model, X_test, y_test, n_repeats=20,
-                                  random_state=cfg.get("random_state", 42), scoring="r2")
-    perm_df = pd.DataFrame({"Feature": X.columns, "Importance": perm.importances_mean,
-                            "Std_Dev": perm.importances_std}) \
+    # Permutation importance for BOTH models, on the same held-out sales, so
+    # they can be compared side by side rather than only XGBoost's ranking
+    # being reported. Same caveat applies to both: these are computed from
+    # final_model/final_rf_model (fit on ALL data, X_test included), same as
+    # the pre-existing XGBoost-only version -- consistent between the two,
+    # but worth knowing the test rows were not truly held out of THIS
+    # particular fit the way they were for the train/test accuracy metrics.
+    perm_x = permutation_importance(final_model, X_test, y_test, n_repeats=20,
+                                    random_state=cfg.get("random_state", 42), scoring="r2")
+    perm_r = permutation_importance(final_rf_model, X_test, y_test, n_repeats=20,
+                                    random_state=cfg.get("random_state", 42), scoring="r2")
+    perm_df = pd.DataFrame({"Feature": X.columns, "Importance": perm_x.importances_mean,
+                            "Std_Dev": perm_x.importances_std}) \
         .sort_values("Importance", ascending=False).reset_index(drop=True)
+    perm_compare = pd.DataFrame({
+        "Feature": X.columns,
+        "XGB_Importance": perm_x.importances_mean, "XGB_Std": perm_x.importances_std,
+        "RF_Importance": perm_r.importances_mean, "RF_Std": perm_r.importances_std,
+    }).sort_values("XGB_Importance", ascending=False).reset_index(drop=True)
+
+    # ------------------------------------------- typical property valuation
+    # A concrete worked example -- not a real subject (the batch pipeline
+    # trains on a market export, it has no specific subject to value). This
+    # is what Steps 15-16 of the original notebook did with a hand-picked
+    # example; this is the same idea without requiring the CSV upload
+    # format to carry subject-property fields.
+    #
+    # Deliberately NOT an all-medians synthetic row: contribution_breakdown
+    # skips any feature already equal to the sample median, so a row built
+    # entirely from medians makes every single feature match and the
+    # breakdown comes back empty -- true by construction, and useless.
+    # Instead, pick the ACTUAL sale whose price is closest to the sample's
+    # median price. It is still representative (typical price), but its
+    # individual characteristics are real and will differ from the medians
+    # the normal way any single property does, so the breakdown has
+    # something real to show.
+    closest_idx = (y - y.median()).abs().idxmin()
+    median_row = X.loc[[closest_idx]]
+    typical_value = float(final_model.predict(median_row)[0])
+    typical_contributions = contribution_breakdown(final_model, median_row, X)
+
+    # Scenario steps only for characteristics the feature-support check
+    # above called "OK" -- varying a WEAK or unsupported feature would
+    # illustrate a difference the sample cannot actually back up.
+    typical_scenarios = {}
+    ok_features = {r["Feature"] for r in support if r["Verdict"].startswith("OK")}
+    for feat in ["garage_spaces", "baths_full", "bedrooms", "fireplaces", "baths_half"]:
+        if feat in ok_features and feat in data.columns:
+            levels = sorted(v for v in data[feat].dropna().unique() if pd.notna(v))
+            if len(levels) >= 2:
+                # at most 4 steps, evenly spread across the observed range
+                step_vals = levels if len(levels) <= 4 else \
+                    [levels[i] for i in np.linspace(0, len(levels) - 1, 4).round().astype(int)]
+                typical_scenarios[feat] = compare_scenarios(
+                    final_model, median_row, feat, sorted(set(step_vals)))
 
     metadata = {
         "model_version": cfg["model_version"],
@@ -344,6 +449,7 @@ def run_dataset(cfg: dict, df_raw: pd.DataFrame | None = None,
             "cv_r2_mean": float(cv_scores.mean()) if cv_scores is not None else None,
             "cv_r2_std": float(cv_scores.std()) if cv_scores is not None else None,
             "cv_folds": cv_folds_used,
+            "log_model_r2": log_r2,
         },
         "model_comparison": {
             "xgboost": {"r2": float(r2_x), "mae": float(mae_x), "rmse": float(rmse_x),
@@ -353,6 +459,8 @@ def run_dataset(cfg: dict, df_raw: pd.DataFrame | None = None,
             "verdict": verdict,
         },
         "data_diagnostics": diag,
+        "feature_support": support,
+        "typical_property_value": round(typical_value, 0),
     }
 
     if write_artifacts:
@@ -398,4 +506,9 @@ def run_dataset(cfg: dict, df_raw: pd.DataFrame | None = None,
         # are NOT from final_model (fit on all data); they are from the
         # earlier xgb_model/rf_model fit, matching the reported test metrics.
         "y_test": y_test, "xgb_test_pred": xp, "rf_test_pred": rp,
+        "importance_compare": perm_compare,
+        "typical_value": typical_value,
+        "typical_contributions": typical_contributions,
+        "typical_scenarios": typical_scenarios,
+        "typical_row": median_row,
     }

@@ -21,6 +21,7 @@ from __future__ import annotations
 import io
 from datetime import datetime, timezone
 
+import pandas as pd
 from PIL import Image as PILImage
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
@@ -448,7 +449,10 @@ def build_report(payload: dict, subject: dict, meta: dict,
 
 def build_market_report(meta: dict, grid, pct, loc, importance,
                         data=None, X=None, y=None,
-                        y_test=None, xgb_test_pred=None, rf_test_pred=None) -> bytes:
+                        y_test=None, xgb_test_pred=None, rf_test_pred=None,
+                        importance_compare=None, typical_value=None,
+                        typical_contributions=None, typical_scenarios=None,
+                        typical_row=None) -> bytes:
     """
     data, X, y : the engineered training frame and design matrix, passed
     through from run_dataset()'s return. Optional and None-safe -- if a
@@ -459,6 +463,17 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
     y_test, xgb_test_pred, rf_test_pred : the held-out later period and
     each model's predictions on it, for the actual-vs-predicted and
     residual diagnostic charts. Also optional and None-safe.
+
+    importance_compare : permutation importance for BOTH models side by
+    side, for the "which characteristics drive price, according to each
+    model" comparison.
+
+    typical_value, typical_contributions, typical_scenarios, typical_row :
+    a worked valuation example using the sample's own median property --
+    not a real subject (a market analysis has no specific subject to
+    value), but a concrete illustration of what the model produces, the
+    same role Steps 15-16 of the original notebook served with a
+    hand-picked example property.
     """
     ss = _styles()
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -510,12 +525,58 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
                                ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold")]))
         S.append(t)
 
+    # The underlying numbers behind the flags above, not just the prose --
+    # so a reader can check the thresholds themselves rather than take the
+    # verdict on faith.
+    if d.get("price_min") is not None:
+        S.append(Spacer(1, 8))
+        S.append(Paragraph("Price range diagnostic", ss["H3"]))
+        rows = [
+            ["Measure", "Value", "Flags if"],
+            ["Sale price minimum", _money(d.get("price_min")), "-"],
+            ["Sale price maximum", _money(d.get("price_max")), "-"],
+            ["Max / min ratio", f"{d.get('price_range_ratio', 0):.2f}x", "below 2.00x"],
+            ["Coefficient of variation", f"{d.get('price_cv', 0):.3f}", "below 0.20"],
+            ["Raw median price per sq ft", _money(d.get("raw_median_ppsf"), 2), "-"],
+            ["Correlation(price, GLA)", f"{d.get('gla_corr', 0):.3f}", "below 0.60"],
+        ]
+        S.append(_table(rows, [2.6 * inch, 2.0 * inch, 2.2 * inch], align_right=[1]))
+        S.append(Paragraph(
+            "An unfiltered market pull normally spans 4x or more in price, with a "
+            "price-to-GLA correlation of 0.70 to 0.90. Values near the flagged "
+            "thresholds mean the export was likely limited to a narrow price band "
+            "before it reached this pipeline.", ss["Small"]))
+
     if meta.get("missing_fields"):
         S.append(Paragraph(
             f"<b>Not present in this export:</b> {', '.join(meta['missing_fields'])}. "
             "These characteristics were excluded from the model rather than valued at zero. "
             "The analysis is silent on them; it does not conclude they are worthless.",
             ss["Body"]))
+
+    # -------------------------------------------------------- feature support
+    support = meta.get("feature_support") or []
+    if support:
+        S.append(Spacer(1, 8))
+        S.append(Paragraph("Feature support", ss["H3"]))
+        S.append(Paragraph(
+            "Can this sample actually answer a question about each characteristic below, "
+            "or does it just look like it can? A coefficient is only as trustworthy as the "
+            "number of sales backing each level of that characteristic -- a feature where "
+            "one value dominates the sample has almost nothing to compare against, and its "
+            "adjustment is closer to noise than to an estimate, whatever its confidence "
+            "interval says.", ss["Body"]))
+        rows = [["Characteristic", "Levels supported", "Dominant share", "Verdict"]]
+        for r in support:
+            share = "-" if r["Dominant_Share"] is None else f"{r['Dominant_Share']:.0%}"
+            verdict = r["Verdict"]
+            color = (GREEN if verdict.startswith("OK") else
+                    RED if verdict.startswith("CANNOT") or verdict.startswith("NOT") else AMBER)
+            rows.append([
+                r["Feature"], str(r["Levels_Supported"]), share,
+                Paragraph(f"<font color='#{color.hexval()[2:]}'>{verdict}</font>", ss["Small"]),
+            ])
+        S.append(_table(rows, [1.9 * inch, 1.5 * inch, 1.4 * inch, 2.7 * inch], align_right=[1, 2]))
 
     # ---------------------------------------------------- exploratory data
     if data is not None and len(data):
@@ -603,6 +664,14 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
     S.append(_table(rows, [2.0 * inch, 0.95 * inch, 1.6 * inch, 0.85 * inch, 1.6 * inch],
                     align_right=[1, 2, 3]))
 
+    supported_rows = [r for r in grid.to_dict("records") if str(r["Use_In_Grid"]).startswith("YES")]
+    S.append(Spacer(1, 6))
+    S.append(Paragraph(
+        f"<b>Defensible adjustments: {len(supported_rows)} of {len(grid)} characteristics.</b> "
+        "These are the ones whose 95 percent interval does not cross zero -- the sample has "
+        "actually shown a nonzero effect, not merely a point estimate with an arbitrary sign.",
+        ss["Small"]))
+
     # ---------------------------------------------------------- location
     if len(loc):
         S.append(Paragraph("Location adjustments", ss["H3"]))
@@ -613,6 +682,82 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
         for r in loc.to_dict("records"):
             rows.append([r["Location"], _money(r["Adjustment_vs_Baseline"])])
         S.append(_table(rows, [3.2 * inch, 2.2 * inch], align_right=[1]))
+
+    # ---------------------------------------- direct answers to the questions
+    grid_by_feat = {r["Feature"]: r for r in grid.to_dict("records")}
+
+    def _rate(feat):
+        """Per-single-unit rate, even when the grid steps by 100 sqft etc."""
+        r = grid_by_feat.get(feat)
+        if r is None or r["Step"] in (0, None):
+            return None, None
+        return r["Adjustment"] / r["Step"], r
+
+    S.append(Spacer(1, 10))
+    S.append(Paragraph("Direct answers to the appraisal questions", ss["H3"]))
+    S.append(Paragraph(
+        "The grid above is the complete result; these are the same numbers stated as plain "
+        "answers to the questions an appraiser actually asks.", ss["Body"]))
+
+    lines = []
+    gla_rate, gla_r = _rate("gla_sqft")
+    bsmt_rate, bsmt_r = _rate("bsmt_fin_sqft")
+    if gla_rate is not None:
+        line = f"<b>1. What is the market paying per square foot?</b> {_money(gla_rate, 2)} per sq ft of above-grade GLA"
+        if bsmt_rate is not None:
+            line += f", and {_money(bsmt_rate, 2)} per sq ft of finished basement"
+            if gla_rate:
+                line += f" ({bsmt_rate / gla_rate * 100:.0f}% of the above-grade rate)"
+        line += f". The average rate in this sample was {_money((y.mean() / X['gla_sqft'].mean()) if X is not None and y is not None else None, 2)} per sq ft -- use the marginal rate above for adjustments, not this average."
+        lines.append(line)
+
+    bf_rate, bf_r = _rate("baths_full")
+    bh_rate, bh_r = _rate("baths_half")
+    if bf_rate is not None or bh_rate is not None:
+        parts = []
+        if bf_rate is not None:
+            parts.append(f"a full bathroom {_money(bf_rate)}")
+        if bh_rate is not None:
+            parts.append(f"a half bathroom {_money(bh_rate)}")
+        line = f"<b>2. What does an additional bathroom bring?</b> " + " and ".join(parts) + "."
+        if bf_rate and bh_rate:
+            line += f" A half bath contributes {bh_rate / bf_rate * 100:.0f}% of a full bath."
+        lines.append(line)
+
+    bed_rate, bed_r = _rate("bedrooms")
+    if bed_rate is not None:
+        line = f"<b>3. What does an additional bedroom bring?</b> {_money(bed_rate)}, holding square footage constant."
+        if bed_rate <= 0:
+            line += (" A near-zero or negative figure here is common and meaningful: once "
+                    "size is already in the model, this measures what the market pays for "
+                    "partitioning the same space into more, smaller rooms -- often little "
+                    "or nothing on its own.")
+        lines.append(line)
+
+    gar_rate, gar_r = _rate("garage_spaces")
+    if gar_rate is not None:
+        line = f"<b>4. What is the difference between a 1-car and 2-car garage?</b> {_money(gar_rate)} per garage bay on average"
+        if typical_scenarios and "garage_spaces" in typical_scenarios:
+            line += " (see the paired scenario table below for whether this step is the same size across the observed range, or whether it changes at higher bay counts)"
+        line += "."
+        lines.append(line)
+
+    mo_rate, mo_r = _rate("months_since_start")
+    if mo_rate is not None:
+        annual = mo_rate * 12
+        pct_of_mean = (annual / y.mean() * 100) if y is not None and y.mean() else None
+        line = f"<b>5. Market conditions (time adjustment).</b> {_money(mo_rate)} per month"
+        if pct_of_mean is not None:
+            line += f", {_money(annual)} per year ({pct_of_mean:+.2f}% of the mean sale price annually)"
+        line += "."
+        lines.append(line)
+
+    age_rate, age_r = _rate("age_at_sale")
+    if age_rate is not None:
+        lines.append(f"<b>6. Depreciation.</b> {_money(age_rate)} per year of effective age.")
+
+    for line in lines:
+        S.append(Paragraph(line, ss["Small"]))
 
     # ----------------------------------------------------------- percent
     S.append(PageBreak())
@@ -629,6 +774,12 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
                      _money(r["Dollar_At_Mean_Price"])])
     S.append(_table(rows, [2.5 * inch, 1.15 * inch, 1.85 * inch, 1.5 * inch],
                     align_right=[1, 3]))
+    log_r2 = meta.get("metrics", {}).get("log_model_r2")
+    if log_r2 is not None:
+        S.append(Paragraph(
+            f"R-squared of the log-price model itself: {log_r2:.4f}. This is the fit quality "
+            "of the model these percentages come from, on the log scale -- not comparable to "
+            "the dollar-scale R-squared reported elsewhere in this report.", ss["Small"]))
 
     # -------------------------------------------------------- importance
     S.append(Paragraph("Relative importance", ss["H2"]))
@@ -644,6 +795,20 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
         from .charts import permutation_importance_chart
         S.append(Spacer(1, 8))
         S.append(_embed_chart(permutation_importance_chart(importance), max_width_inch=6.2))
+
+    if importance_compare is not None and len(importance_compare):
+        S.append(Spacer(1, 10))
+        S.append(Paragraph("Importance: XGBoost against Random Forest", ss["H3"]))
+        S.append(Paragraph(
+            "The same permutation-importance check run against both models. Two models "
+            "agreeing on WHICH characteristics matter most is a stronger signal than either "
+            "ranking alone -- if one model relies heavily on a characteristic the other "
+            "ignores, that characteristic's importance is model-specific, not a property of "
+            "the market.", ss["Body"]))
+        rows = [["Characteristic", "XGBoost", "Random Forest"]]
+        for r in importance_compare.head(12).to_dict("records"):
+            rows.append([r["Feature"], f"{r['XGB_Importance']:.4f}", f"{r['RF_Importance']:.4f}"])
+        S.append(_table(rows, [2.8 * inch, 1.6 * inch, 1.6 * inch], align_right=[1, 2]))
 
     # --------------------------------------------------- model selection
     S.append(Paragraph("Model selection: XGBoost against Random Forest", ss["H2"]))
@@ -735,6 +900,52 @@ def build_market_report(meta: dict, grid, pct, loc, importance,
             f"Cross-validated R-squared across {m.get('cv_folds', 5)} folds: "
             f"{m['cv_r2_mean']:.4f} (standard deviation {m.get('cv_r2_std', 0):.4f}).",
             ss["Body"]))
+
+    # ------------------------------------------------- typical property
+    if typical_value is not None:
+        S.append(PageBreak())
+        S.append(Paragraph("Typical property in this market", ss["H2"]))
+        S.append(Paragraph(
+            "A worked example, not a real subject -- this market analysis has no specific "
+            "property to value. The 'typical property' below is the ACTUAL closed sale whose "
+            "price is closest to this sample's median, so its characteristics are real rather "
+            "than an artificial blend, while its price is representative of the market. The "
+            "indicated figure is a concrete illustration of what the model produces, not an "
+            "appraisal of anything.",
+            ss["Body"]))
+        S.append(Paragraph(f"<b>Indicated value: {_money(typical_value)}</b>", ss["Body"]))
+
+        if typical_contributions is not None and len(typical_contributions):
+            S.append(Paragraph(
+                "What drives this value away from the sample median", ss["H3"]))
+            S.append(Paragraph(
+                "Each line is how much the indicated value would change if that one "
+                "characteristic were moved back to the sample median -- for the median "
+                "property itself this is necessarily small or zero for most characteristics "
+                "by construction; nonzero rows usually reflect location.", ss["Small"]))
+            rows = [["Characteristic", "Value", "Sample median", "Contribution"]]
+            for r in typical_contributions.to_dict("records"):
+                rows.append([r["Feature"], f"{r['Subject_Value']:,.0f}",
+                            f"{r['Sample_Median']:,.0f}", _money(r["Contribution"])])
+            S.append(_table(rows, [2.4 * inch, 1.3 * inch, 1.5 * inch, 1.4 * inch],
+                            align_right=[1, 2, 3]))
+
+        if typical_scenarios:
+            S.append(Paragraph("Paired scenario analysis", ss["H3"]))
+            S.append(Paragraph(
+                "Identical properties differing in exactly one characteristic, restricted to "
+                "characteristics the feature-support check above rated OK. This is the "
+                "direct check on whether a step (for example 1-car to 2-car garage) is the "
+                "same size across the observed range, or changes at different levels.",
+                ss["Small"]))
+            for feat, sc in typical_scenarios.items():
+                rows = [[feat, "Indicated value", "Step change"]]
+                for _, r in sc.iterrows():
+                    diff = r.get("Difference")
+                    rows.append([f"{r[feat]:,.0f}", _money(r["Indicated_Value"]),
+                                "-" if pd.isna(diff) else _money(diff)])
+                S.append(_table(rows, [1.7 * inch, 1.7 * inch, 1.6 * inch], align_right=[0, 1, 2]))
+                S.append(Spacer(1, 6))
 
     # -------------------------------------------------------------- basis
     S.append(Paragraph("Basis and limitations", ss["H2"]))
